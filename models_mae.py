@@ -25,8 +25,12 @@ class MaskedAutoencoderViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3,
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,input_norm=True):
         super().__init__()
+
+        self.in_chans = in_chans
+        self.input_norm = input_norm
+        self.bn0 = nn.BatchNorm2d(in_chans)
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -37,7 +41,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         # --------------------------------------------------------------------------
@@ -51,7 +55,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
         self.decoder_blocks = nn.ModuleList([
-            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -101,9 +105,9 @@ class MaskedAutoencoderViT(nn.Module):
         assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
 
         h = w = imgs.shape[2] // p
-        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = imgs.reshape(shape=(imgs.shape[0], self.in_chans, h, p, w, p))
         x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * self.in_chans))
         return x
 
     def unpatchify(self, x):
@@ -115,9 +119,9 @@ class MaskedAutoencoderViT(nn.Module):
         h = w = int(x.shape[1]**.5)
         assert h * w == x.shape[1]
         
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, self.in_chans))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], self.in_chans, h * p, h * p))
         return imgs
 
     def random_masking(self, x, mask_ratio):
@@ -214,6 +218,8 @@ class MaskedAutoencoderViT(nn.Module):
         return loss
 
     def forward(self, imgs, mask_ratio=0.75):
+        if self.input_norm:
+            imgs = self.bn0(imgs)
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         loss = self.forward_loss(imgs, pred, mask)
