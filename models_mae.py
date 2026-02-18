@@ -25,12 +25,13 @@ class MaskedAutoencoderViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3,
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,input_norm=True):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,input_norm=True,decoder_pred_intermediate=32):
         super().__init__()
 
         self.in_chans = in_chans
         self.input_norm = input_norm
         self.bn0 = nn.BatchNorm2d(in_chans)
+        self.patch_size = patch_size
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -58,8 +59,10 @@ class MaskedAutoencoderViT(nn.Module):
             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(decoder_depth)])
 
+        self.decoder_pred_intermediate = decoder_pred_intermediate
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
+        self.decoder_pred_coarse = nn.Linear(decoder_embed_dim, patch_size ** 2 * self.decoder_pred_intermediate,bias=True)  # decoder to patch
+        self.decoder_pred_fine = nn.Linear(self.decoder_pred_intermediate, in_chans, bias=True)  # decoder to patch
         # --------------------------------------------------------------------------
 
         self.norm_pix_loss = norm_pix_loss
@@ -191,11 +194,17 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         x = self.decoder_norm(x)
 
-        # predictor projection
-        x = self.decoder_pred(x)
-
         # remove cls token
         x = x[:, 1:, :]
+
+        # predictor projection
+        N, L, D = x.shape
+        x = self.decoder_pred_coarse(x).reshape(
+            N, L, self.patch_size, self.patch_size, self.decoder_pred_intermediate
+        )  # N x L x D -> N x L x patch_dim x patch_dim x decoder_pred_intermediate
+        x = self.decoder_pred_fine(x).reshape(
+            N, L, self.patch_size * self.patch_size * self.in_chans
+        )  # N x L x patch_dim x patch_dim x decoder_pred_intermediate -> N x L x (patch_dim * patch_dim * wavenumber_channels)
 
         return x
 
@@ -210,6 +219,151 @@ class MaskedAutoencoderViT(nn.Module):
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
+
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        return loss
+
+    def forward(self, imgs, mask_ratio=0.75):
+        if self.input_norm:
+            imgs = self.bn0(imgs)
+        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
+        loss = self.forward_loss(imgs, pred, mask)
+        return loss, pred, mask
+
+
+class MaskedImageModellingViT(MaskedAutoencoderViT):
+    """ Masked Image modelling with VisionTransformer backbone
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3,
+                 embed_dim=1024, depth=24, num_heads=16,
+                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, input_norm=True, decoder_pred_intermediate=32):
+        super().__init__(img_size=img_size, patch_size=patch_size, in_chans=in_chans,
+                 embed_dim=embed_dim, depth=depth, num_heads=num_heads,
+                 decoder_embed_dim=decoder_embed_dim, decoder_depth=decoder_depth, decoder_num_heads=decoder_num_heads,
+                 mlp_ratio=mlp_ratio, norm_layer=norm_layer, norm_pix_loss=norm_pix_loss, input_norm=input_norm, decoder_pred_intermediate=decoder_pred_intermediate)
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+    def patchify(self, imgs):
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *3)
+        """
+        p = self.patch_embed.patch_size[0]
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], self.in_chans, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * self.in_chans))
+        return x
+
+    def unpatchify(self, x):
+        """
+        x: (N, L, patch_size**2 *3)
+        imgs: (N, 3, H, W)
+        """
+        p = self.patch_embed.patch_size[0]
+        h = w = int(x.shape[1] ** .5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, self.in_chans))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], self.in_chans, h * p, h * p))
+        return imgs
+
+    def random_masking(self, x, mask_ratio):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
+
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        # keep the first subset
+        mask_tokens = self.mask_token.repeat(x.shape[0], x.shape[1], 1)
+        x_masked = torch.where(mask.unsqueeze(-1)==0, x, mask_tokens)
+
+        return x_masked, mask, ids_restore
+
+    def forward_encoder(self, x, mask_ratio):
+        # embed patches
+        x = self.patch_embed(x)
+
+        # add pos embed w/o cls token
+        x = x + self.pos_embed[:, 1:, :]
+
+        # masking: length -> length
+        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+
+        # append cls token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        # apply Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+
+        return x, mask, ids_restore
+
+    def forward_decoder(self, x, ids_restore):
+        # embed tokens
+        x = self.decoder_embed(x)
+
+        # add pos embed
+        x = x + self.decoder_pos_embed
+
+        # apply Transformer blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
+        # remove cls token
+        x = x[:, 1:, :]
+
+        # predictor projection
+        N, L, D  = x.shape
+        x = self.decoder_pred_coarse(x).reshape(
+            N, L, self.patch_size, self.patch_size,self.decoder_pred_intermediate
+        ) # N x L x D -> N x L x patch_dim x patch_dim x decoder_pred_intermediate
+        x = self.decoder_pred_fine(x).reshape(
+            N, L, self.patch_size * self.patch_size * self.in_chans
+        ) # N x L x patch_dim x patch_dim x decoder_pred_intermediate -> N x L x (patch_dim * patch_dim * wavenumber_channels)
+
+        return x
+
+    def forward_loss(self, imgs, pred, mask):
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove,
+        """
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6) ** .5
 
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
