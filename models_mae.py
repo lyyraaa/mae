@@ -30,7 +30,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.in_chans = in_chans
         self.input_norm = input_norm
-        self.bn0 = nn.BatchNorm2d(in_chans)
+        self.bn0 = nn.BatchNorm2d(in_chans,affine=False)
         self.patch_size = patch_size
 
         # --------------------------------------------------------------------------
