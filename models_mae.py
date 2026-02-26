@@ -235,6 +235,93 @@ class MaskedAutoencoderViT(nn.Module):
         return loss, pred, mask
 
 
+class MaskedAutoencoderViT_discrete(MaskedAutoencoderViT):
+    """ Masked Autoencoder with VisionTransformer backbone
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3,
+                 embed_dim=1024, depth=24, num_heads=16,
+                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, input_norm=True,
+                 decoder_pred_intermediate=32,num_quants=256):
+        super().__init__(img_size=img_size, patch_size=patch_size, in_chans=in_chans,
+                 embed_dim=embed_dim, depth=depth, num_heads=num_heads,
+                 decoder_embed_dim=decoder_embed_dim, decoder_depth=decoder_depth, decoder_num_heads=decoder_num_heads,
+                 mlp_ratio=mlp_ratio, norm_layer=norm_layer, norm_pix_loss=norm_pix_loss, input_norm=input_norm,
+                 decoder_pred_intermediate=decoder_pred_intermediate)
+
+        self.num_quants = num_quants
+        self.decoder_pred_fine = nn.Linear(self.decoder_pred_intermediate, num_quants, bias=True)  # decoder to patch
+
+    def patchify(self, imgs, chans=None):
+        if chans is None: chans = self.in_chans
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *3)
+        """
+        p = self.patch_embed.patch_size[0]
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], chans, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * chans))
+        return x
+
+    def unpatchify(self, x, chans=None):
+        if chans is None: chans = self.in_chans
+        """
+        x: (N, L, patch_size**2 *3)
+        imgs: (N, 3, H, W)
+        """
+        p = self.patch_embed.patch_size[0]
+        h = w = int(x.shape[1] ** .5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, chans))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], chans, h * p, h * p))
+        return imgs
+
+    def forward_decoder(self, x, ids_restore):
+        # embed tokens
+        x = self.decoder_embed(x)
+
+        # append mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+
+        # add pos embed
+        x = x + self.decoder_pos_embed
+
+        # apply Transformer blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
+        # remove cls token
+        x = x[:, 1:, :]
+
+        # predictor projection
+        N, L, D = x.shape
+        x = self.decoder_pred_coarse(x).reshape(
+            N, L, self.patch_size, self.patch_size, self.decoder_pred_intermediate
+        )  # N x L x D -> N x L x patch_dim x patch_dim x decoder_pred_intermediate
+        x = self.decoder_pred_fine(x).reshape(
+            N, L, self.patch_size * self.patch_size * self.num_quants
+        )  # N x L x patch_dim x patch_dim x decoder_pred_intermediate -> N x L x (patch_dim * patch_dim * wavenumber_channels)
+
+        return x
+
+    def forward(self, imgs, mask_ratio=0.75):
+        if self.input_norm:
+            imgs = self.bn0(imgs)
+        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+        pred = self.forward_decoder(latent, ids_restore)  # N, L, 256 [N, L, p*p*3]
+        return pred, mask
+
 class MaskedImageModellingViT(MaskedAutoencoderViT):
     """ Masked Image modelling with VisionTransformer backbone
     """
