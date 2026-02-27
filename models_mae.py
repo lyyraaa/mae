@@ -99,7 +99,8 @@ class MaskedAutoencoderViT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def patchify(self, imgs):
+    def patchify(self, imgs, chans=None):
+        if chans is None: chans = self.in_chans
         """
         imgs: (N, 3, H, W)
         x: (N, L, patch_size**2 *3)
@@ -108,23 +109,24 @@ class MaskedAutoencoderViT(nn.Module):
         assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
 
         h = w = imgs.shape[2] // p
-        x = imgs.reshape(shape=(imgs.shape[0], self.in_chans, h, p, w, p))
+        x = imgs.reshape(shape=(imgs.shape[0], chans, h, p, w, p))
         x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * self.in_chans))
+        x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * chans))
         return x
 
-    def unpatchify(self, x):
+    def unpatchify(self, x, chans=None):
+        if chans is None: chans = self.in_chans
         """
         x: (N, L, patch_size**2 *3)
         imgs: (N, 3, H, W)
         """
         p = self.patch_embed.patch_size[0]
-        h = w = int(x.shape[1]**.5)
+        h = w = int(x.shape[1] ** .5)
         assert h * w == x.shape[1]
-        
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, self.in_chans))
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, chans))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], self.in_chans, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], chans, h * p, h * p))
         return imgs
 
     def random_masking(self, x, mask_ratio):
@@ -252,36 +254,6 @@ class MaskedAutoencoderViT_discrete(MaskedAutoencoderViT):
 
         self.num_quants = num_quants
         self.decoder_pred_fine = nn.Linear(self.decoder_pred_intermediate, num_quants, bias=True)  # decoder to patch
-
-    def patchify(self, imgs, chans=None):
-        if chans is None: chans = self.in_chans
-        """
-        imgs: (N, 3, H, W)
-        x: (N, L, patch_size**2 *3)
-        """
-        p = self.patch_embed.patch_size[0]
-        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
-
-        h = w = imgs.shape[2] // p
-        x = imgs.reshape(shape=(imgs.shape[0], chans, h, p, w, p))
-        x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * chans))
-        return x
-
-    def unpatchify(self, x, chans=None):
-        if chans is None: chans = self.in_chans
-        """
-        x: (N, L, patch_size**2 *3)
-        imgs: (N, 3, H, W)
-        """
-        p = self.patch_embed.patch_size[0]
-        h = w = int(x.shape[1] ** .5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, chans))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], chans, h * p, h * p))
-        return imgs
 
     def forward_decoder(self, x, ids_restore):
         # embed tokens
