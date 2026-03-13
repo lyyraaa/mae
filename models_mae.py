@@ -13,7 +13,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-
+import numpy as np
 from timm.models.vision_transformer import PatchEmbed, Block
 
 from util.pos_embed import get_2d_sincos_pos_embed
@@ -32,6 +32,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.input_norm = input_norm
         self.bn0 = nn.BatchNorm2d(in_chans,affine=False)
         self.patch_size = patch_size
+        self.img_size = img_size
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -293,6 +294,115 @@ class MaskedAutoencoderViT_discrete(MaskedAutoencoderViT):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # N, L, 256 [N, L, p*p*3]
         return pred, mask
+
+class MaskedAutoencoderViT_Cat(MaskedAutoencoderViT):
+    """ Masked Autoencoder with VisionTransformer backbone
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3,
+                 embed_dim=1024, depth=24, num_heads=16,
+                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,input_norm=True,decoder_pred_intermediate=32):
+        super().__init__(img_size=img_size, patch_size=patch_size, in_chans=in_chans,
+                 embed_dim=embed_dim, depth=depth, num_heads=num_heads,
+                 decoder_embed_dim=decoder_embed_dim, decoder_depth=decoder_depth, decoder_num_heads=decoder_num_heads,
+                 mlp_ratio=mlp_ratio, norm_layer=norm_layer, norm_pix_loss=norm_pix_loss, input_norm=input_norm,
+                 decoder_pred_intermediate=decoder_pred_intermediate)
+
+        self.linear_proj = nn.Conv2d(in_chans, decoder_pred_intermediate, kernel_size=1)
+        self.heads = nn.Sequential(
+            nn.Conv2d(decoder_pred_intermediate * 2,
+                      decoder_pred_intermediate * 2, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(decoder_pred_intermediate * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(decoder_pred_intermediate * 2, decoder_pred_intermediate, kernel_size=3, stride=1,
+                      padding=1, bias=False),
+            nn.BatchNorm2d(decoder_pred_intermediate),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(decoder_pred_intermediate, in_chans, kernel_size=3, stride=1, padding=1),
+        )
+        self.learnable_spectral_mask_token = nn.Parameter(
+            torch.tensor(np.random.normal(loc=0.0, scale=0.02, size=(1, decoder_pred_intermediate, 1, 1)),
+                         dtype=torch.float32)) # todo make torch instead of numpy; remove numpy import
+
+    def forward_decoder(self, x, ids_restore):
+        # embed tokens
+        x = self.decoder_embed(x)
+
+        # append mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+
+        # add pos embed
+        x = x + self.decoder_pos_embed
+
+        # apply Transformer blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+
+        # remove cls token
+        x = x[:, 1:, :]
+
+        # predictor projection
+        N, L, D = x.shape
+        x = self.decoder_pred_coarse(x).reshape(
+            N, L, self.patch_size * self.patch_size * self.decoder_pred_intermediate
+        )  # N x L x D -> N x L x patch_dim *patch_dim*decoder_pred_intermediate
+
+        return x
+
+    def forward_loss(self, imgs, pred, mask):
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove,
+        target: [N, L, p*p*3]
+        """
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5
+
+        # Project input image to pred intermediate channel dim
+        img_projected = self.linear_proj(imgs) # [B, 32, H, W]
+        img_projected = self.patchify(img_projected,chans=self.decoder_pred_intermediate) # [B, L, p*p*32]
+
+        # Mask out projected input the same way that the input to encoder was. Masked pixels replaced with a mask spectral token
+        spectral_mask_tokens = self.learnable_spectral_mask_token.repeat(target.shape[0], 1, self.img_size, self.img_size) # [B, H, W, 32]
+        spectral_mask_tokens = self.patchify(spectral_mask_tokens,chans=self.decoder_pred_intermediate) # [B, L, p*p*32]
+        img_projected = torch.where(
+            mask.unsqueeze(-1).bool(),
+            spectral_mask_tokens,# where mask ==1, tissue was hidden from encoder, so we use mask tokens
+            img_projected # where mask ==0, tissue is kept for encoder, so we use the projected img
+        ) # [B, L, p*p*32
+
+        # Concatenate pred and img-projected, send through heads
+        pred = self.heads(
+            torch.cat([
+                self.unpatchify(img_projected,chans=self.decoder_pred_intermediate),
+                self.unpatchify(pred,chans=self.decoder_pred_intermediate),
+            ], dim=1)
+        ) # [B, 405, H, W]
+        pred = self.patchify(pred, chans=self.in_chans) # [N, L, p*p*3]
+
+        # Calculate loss
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        return loss
+
+    def forward(self, imgs, mask_ratio=0.75):
+        if self.input_norm:
+            imgs = self.bn0(imgs)
+        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
+        loss = self.forward_loss(imgs, pred, mask)
+        return loss, pred, mask
 
 class MaskedImageModellingViT(MaskedAutoencoderViT):
     """ Masked Image modelling with VisionTransformer backbone
