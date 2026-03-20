@@ -33,6 +33,8 @@ class MaskedAutoencoderViT(nn.Module):
         self.bn0 = nn.BatchNorm2d(in_chans,affine=False)
         self.patch_size = patch_size
         self.img_size = img_size
+        self.embed_dim = embed_dim
+        self.decoder_embed_dim = decoder_embed_dim
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -99,6 +101,20 @@ class MaskedAutoencoderViT(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    # Reset the size of the position encodings used in the model
+    def reset_pos_encodings(self, new_image_size, device):
+        # Get 2d sincos embedding for the new grid size implied by new image size
+        new_pos_encoding = get_2d_sincos_pos_embed(self.embed_dim, grid_size=new_image_size // self.patch_size, cls_token=True)
+        new_decoder_pos_encoding = get_2d_sincos_pos_embed(self.decoder_embed_dim, grid_size=new_image_size // self.patch_size, cls_token=True)
+
+        # Set position embed to this new encoding
+        self.pos_embed.data = torch.from_numpy(new_pos_encoding).float().unsqueeze(0).to(device)
+        self.decoder_pos_embed.data = torch.from_numpy(new_decoder_pos_encoding).float().unsqueeze(0).to(device)
+
+        # Reset model expected image size
+        self.img_size = new_image_size
+        self.patch_embed.strict_img_size = False
 
     def patchify(self, imgs, chans=None):
         if chans is None: chans = self.in_chans
@@ -394,14 +410,14 @@ class MaskedAutoencoderViT_Cat(MaskedAutoencoderViT):
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
 
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
-        return loss
+        return loss, pred
 
     def forward(self, imgs, mask_ratio=0.75):
         if self.input_norm:
             imgs = self.bn0(imgs)
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss = self.forward_loss(imgs, pred, mask)
+        loss, pred = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
 
 class MaskedImageModellingViT(MaskedAutoencoderViT):
