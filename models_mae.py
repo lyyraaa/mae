@@ -25,7 +25,7 @@ class MaskedAutoencoderViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3,
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,input_norm=True,decoder_pred_intermediate=32):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,input_norm=True,decoder_pred_intermediate=32,zero_tissue_mask=False):
         super().__init__()
 
         self.in_chans = in_chans
@@ -35,6 +35,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.img_size = img_size
         self.embed_dim = embed_dim
         self.decoder_embed_dim = decoder_embed_dim
+        self.zero_tissue_mask = zero_tissue_mask
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -245,12 +246,50 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
+    def forward_loss_zeromask(self, imgs, pred, token_mask, tissue_mask):
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        token_mask: [N, L], 0 is keep, 1 is remove,
+        tissue_mask: [N, 3, H, W]
+        """
+        chans = imgs.shape[1]
+        target = self.patchify(imgs) # [N, L, p*p*3]
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5
+
+        # calculate MSE between pred and target
+        loss = (pred - target) ** 2 # [N, L, p*p*3]
+
+        # extend token mask to full image size
+        token_mask = torch.repeat_interleave(
+            torch.repeat_interleave(
+                token_mask.reshape(token_mask.shape[0], 1, self.img_size // self.patch_size, self.img_size // self.patch_size), self.patch_size, dim=2
+            ), self.patch_size, dim=3
+        )
+
+        # pixels we are concerned with are both: tissue (1 in tissue mask) AND removed during masking (1 in token mask)
+        combined_mask = tissue_mask * token_mask # [N, 1, H, W]
+
+        # calculate loss per pixel in image space
+        loss_per_pixel = self.unpatchify(loss, chans=chans).mean(1,keepdim=True) # [N, 1, H, W]
+
+        # ignore loss contribution from pixels we don't care about, calculate mean loss per pixel
+        loss = (loss_per_pixel * combined_mask).sum() / combined_mask.sum() # [N, 1, H, W] -> 1
+
+        return loss
+
+    def forward(self, imgs, mask_ratio=0.75, tissue_mask=None):
         if self.input_norm:
             imgs = self.bn0(imgs)
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss = self.forward_loss(imgs, pred, mask)
+        if self.zero_tissue_mask:
+            loss = self.forward_loss(imgs, pred, mask)
+        else:
+            loss = self.forward_loss_zeromask(imgs, pred, mask, tissue_mask)
         return loss, pred, mask
 
 
