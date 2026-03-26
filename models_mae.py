@@ -287,9 +287,9 @@ class MaskedAutoencoderViT(nn.Module):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         if self.zero_tissue_mask:
-            loss = self.forward_loss(imgs, pred, mask)
-        else:
             loss = self.forward_loss_zeromask(imgs, pred, mask, tissue_mask)
+        else:
+            loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
 
 
