@@ -22,7 +22,7 @@ class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
 
-    def __init__(self, img_dims, patch_dims, pos_encoding_params,
+    def __init__(self, img_dims, patch_dims, pos_encoding_params,learn_bg_encoding=False,
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
@@ -38,6 +38,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.embed_dim = embed_dim
         self.decoder_embed_dim = decoder_embed_dim
         self.use_spatial_pos_encoding, self.use_spectral_pos_encoding, self.learnable_spatial_pos_encoding,self.learnable_spectral_pos_encoding = pos_encoding_params
+        self.learn_bg_encoding = learn_bg_encoding
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -53,6 +54,9 @@ class MaskedAutoencoderViT(nn.Module):
             torch.zeros(1, self.num_spatial_patches, embed_dim), requires_grad=self.learnable_spatial_pos_encoding)
         self.encoder_spectral_pos_embed = nn.Parameter(
             torch.zeros(1, self.num_spectral_patches, embed_dim), requires_grad=self.learnable_spectral_pos_encoding)
+
+        self.background_embed = nn.Parameter(
+            torch.zeros(1, self.img_dims[0], 1, 1), requires_grad=self.learn_bg_encoding)
 
         # --------------------------------------------------------------------------
 
@@ -101,6 +105,9 @@ class MaskedAutoencoderViT(nn.Module):
             decoder_spectral_pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim=self.decoder_embed_dim, pos=np.arange(0, self.num_spectral_patches))
             self.encoder_spectral_pos_embed.data.copy_(torch.from_numpy(encoder_spectral_pos_embed).float().unsqueeze(0))
             self.decoder_spectral_pos_embed.data.copy_(torch.from_numpy(decoder_spectral_pos_embed).float().unsqueeze(0))
+
+        if self.learn_bg_encoding:
+            torch.nn.init.normal_(self.background_embed, std=.02)
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
         torch.nn.init.normal_(self.cls_token, std=.02)
@@ -173,6 +180,22 @@ class MaskedAutoencoderViT(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore
+
+    def encode_background(self, imgs, tissue_mask):
+        """
+        imgs: [B, C, H, W]
+        tissue_mask: [B, 1, H, W]
+        """
+        if not self.learn_bg_encoding: return imgs
+        B, C, H, W = imgs.shape
+
+        # place learnable background vector at all non-tissue pixels
+        encoded_bg = (1-tissue_mask) * self.background_embed.expand(B, -1, H, W)
+
+        # Zero pixels in background, then add the encoded vectors
+        imgs = (imgs * tissue_mask) + encoded_bg
+
+        return imgs
 
     def forward_encoder(self, x, mask_ratio):
         """
@@ -257,7 +280,8 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
+    def forward(self, imgs, tissue_mask, mask_ratio=0.75):
+        imgs = self.encode_background(imgs, tissue_mask) # todo try moving this inside the next line, so encoded bg is not predicted
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [B, L, D]
         loss = self.forward_loss(imgs, pred, mask)
